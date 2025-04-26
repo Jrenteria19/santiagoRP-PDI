@@ -9,12 +9,16 @@ import asyncio
 import uuid
 from datetime import datetime
 import pytz
-import sqlite3
+import mysql.connector
 import datetime as dt
 
 # Cargar variables de entorno
 load_dotenv()
 TOKEN = os.getenv('DISCORD_TOKEN')
+MYSQL_HOST = os.getenv('MYSQL_HOST')
+MYSQL_USER = os.getenv('MYSQL_USER')
+MYSQL_PASSWORD = os.getenv('MYSQL_PASSWORD')
+MYSQL_DATABASE = os.getenv('MYSQL_DATABASE')
 
 # Configuración del bot
 intents = discord.Intents.default()
@@ -53,38 +57,47 @@ class Roles:
     BUSCA_PING = 1345894049835384857       # Rol a pingear en /buscar-a
     HORAS_SEMANALES_ALLOWED = [1345894049848229964, 1345894049848229968]
 
-# Configuración de la base de datos SQLite
+# Configuración de la base de datos MySQL
 def init_db():
-    conn = sqlite3.connect('service_records.db')
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS service_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            start_time TEXT NOT NULL,
-            end_time TEXT,
-            hours REAL
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
         )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS user_hours (
-            user_id INTEGER PRIMARY KEY,
-            total_hours REAL NOT NULL DEFAULT 0
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS sanciones (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            oficial_id INTEGER NOT NULL,
-            razon TEXT NOT NULL,
-            tipo_sancion INTEGER NOT NULL,
-            foto_prueba TEXT,
-            timestamp TEXT NOT NULL
-        )
-    ''')
-    conn.commit()
-    conn.close()
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS service_records (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                start_time VARCHAR(255) NOT NULL,
+                end_time VARCHAR(255),
+                hours FLOAT
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS user_hours (
+                user_id BIGINT PRIMARY KEY,
+                total_hours FLOAT NOT NULL DEFAULT 0
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS sanciones (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                oficial_id BIGINT NOT NULL,
+                razon TEXT NOT NULL,
+                tipo_sancion BIGINT NOT NULL,
+                foto_prueba TEXT,
+                timestamp VARCHAR(255) NOT NULL
+            )
+        ''')
+        conn.commit()
+        conn.close()
+        print("Base de datos inicializada correctamente.")
+    except mysql.connector.Error as err:
+        print(f"Error al inicializar la base de datos: {err}")
 
 # Inicializar base de datos al arrancar
 init_db()
@@ -109,7 +122,7 @@ def is_allowed_horas_semanales():
                 color=Colors.DANGER
             ), ephemeral=True)
             return False
-        allowed_roles = Roles.HORAS_SEMANALES_ALLOWED  # Corrección: Usar notación de punto
+        allowed_roles = Roles.HORAS_SEMANALES_ALLOWED
         has_role = any(role.id in allowed_roles for role in interaction.user.roles)
         if not has_role:
             await interaction.response.send_message(embed=create_embed(
@@ -124,7 +137,7 @@ def is_allowed_horas_semanales():
 # Decorador para verificar el canal de horas semanales
 def is_horas_semanales_channel():
     async def predicate(interaction: Interaction) -> bool:
-        if interaction.channel_id != Channels.HORAS_SEMANALES:  # Corrección: Usar notación de punto
+        if interaction.channel_id != Channels.HORAS_SEMANALES:
             await interaction.response.send_message(embed=create_embed(
                 title="❌ Canal Incorrecto",
                 description=f"Este comando solo puede usarse en <#{Channels.HORAS_SEMANALES}>",
@@ -136,7 +149,7 @@ def is_horas_semanales_channel():
 
 def is_sancionar_channel():
     async def predicate(interaction: Interaction) -> bool:
-        if interaction.channel_id != Channels.SUGERIR_INPUT:  # 1345894050770845825
+        if interaction.channel_id != Channels.SUGERIR_INPUT:
             await interaction.response.send_message(embed=create_embed(
                 title="❌ Canal Incorrecto",
                 description=f"Este comando solo puede usarse en <#{Channels.SUGERIR_INPUT}>",
@@ -177,59 +190,71 @@ class ServiceButtons(ui.View):
 
         local_tz = pytz.timezone('America/Mazatlan')
         end_time = datetime.now(local_tz)
-        conn = sqlite3.connect('service_records.db')
-        c = conn.cursor()
-        c.execute('SELECT start_time FROM service_records WHERE user_id = ? AND end_time IS NULL', (self.user_id,))
-        result = c.fetchone()
-        if not result:
+        try:
+            conn = mysql.connector.connect(
+                host=MYSQL_HOST,
+                user=MYSQL_USER,
+                password=MYSQL_PASSWORD,
+                database=MYSQL_DATABASE
+            )
+            c = conn.cursor()
+            c.execute('SELECT start_time FROM service_records WHERE user_id = %s AND end_time IS NULL', (self.user_id,))
+            result = c.fetchone()
+            if not result:
+                await interaction.response.send_message(embed=create_embed(
+                    title="❌ Error",
+                    description="No se encontró un servicio activo.",
+                    color=Colors.DANGER
+                ), ephemeral=True)
+                conn.close()
+                return
+
+            start_time = datetime.fromisoformat(result[0]).astimezone(local_tz)
+            hours = (end_time - start_time).total_seconds() / 3600
+            minutes = hours * 60
+
+            # Actualizar registro de servicio
+            c.execute('UPDATE service_records SET end_time = %s, hours = %s WHERE user_id = %s AND end_time IS NULL',
+                      (end_time.isoformat(), hours, self.user_id))
+            
+            # Actualizar horas totales del usuario
+            c.execute('INSERT INTO user_hours (user_id, total_hours) VALUES (%s, %s) ON DUPLICATE KEY UPDATE total_hours = total_hours + %s',
+                      (self.user_id, hours, hours))
+            conn.commit()
+            conn.close()
+
+            # Enviar mensaje al canal
+            channel = bot.get_channel(Channels.SERVICIO)
+            embed = create_embed(
+                title="⏰ Servicio Finalizado | Santiago RP",
+                description=f"**{interaction.user.mention}** ha finalizado su servicio.",
+                color=Colors.PRIMARY
+            )
+            embed.add_field(name="Usuario", value=interaction.user.mention, inline=True)
+            embed.add_field(name="Hora de Entrada", value=start_time.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
+            embed.add_field(name="Hora de Salida", value=end_time.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
+            embed.add_field(name="Duración", value=f"{hours:.2f} horas ({minutes:.0f} minutos)", inline=True)
+            embed.set_thumbnail(url=bot.user.avatar.url if bot.user.avatar else None)
+            await channel.send(embed=embed)
+
+            # Actualizar mensaje en DM para remover el botón
+            try:
+                await interaction.message.edit(view=None)
+            except discord.HTTPException:
+                pass  # Ignorar si no se puede editar el mensaje
+
+            # Confirmación al usuario
+            await interaction.response.send_message(embed=create_embed(
+                title="✅ Servicio Terminado",
+                description=f"Has terminado tu servicio. Duración: **{hours:.2f} horas** ({minutes:.0f} minutos).",
+                color=Colors.SUCCESS
+            ), ephemeral=True)
+        except mysql.connector.Error as err:
             await interaction.response.send_message(embed=create_embed(
                 title="❌ Error",
-                description="No se encontró un servicio activo.",
+                description=f"No se pudo terminar el servicio debido a un error en la base de datos: {err}",
                 color=Colors.DANGER
             ), ephemeral=True)
-            conn.close()
-            return
-
-        start_time = datetime.fromisoformat(result[0]).astimezone(local_tz)
-        hours = (end_time - start_time).total_seconds() / 3600
-        minutes = hours * 60
-
-        # Actualizar registro de servicio
-        c.execute('UPDATE service_records SET end_time = ?, hours = ? WHERE user_id = ? AND end_time IS NULL',
-                  (end_time.isoformat(), hours, self.user_id))
-        
-        # Actualizar horas totales del usuario
-        c.execute('INSERT OR REPLACE INTO user_hours (user_id, total_hours) VALUES (?, COALESCE((SELECT total_hours FROM user_hours WHERE user_id = ?), 0) + ?)',
-                  (self.user_id, self.user_id, hours))
-        conn.commit()
-        conn.close()
-
-        # Enviar mensaje al canal
-        channel = bot.get_channel(Channels.SERVICIO)
-        embed = create_embed(
-            title="⏰ Servicio Finalizado | Santiago RP",
-            description=f"**{interaction.user.mention}** ha finalizado su servicio.",
-            color=Colors.PRIMARY
-        )
-        embed.add_field(name="Usuario", value=interaction.user.mention, inline=True)
-        embed.add_field(name="Hora de Entrada", value=start_time.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
-        embed.add_field(name="Hora de Salida", value=end_time.strftime('%Y-%m-%d %H:%M:%S'), inline=True)
-        embed.add_field(name="Duración", value=f"{hours:.2f} horas ({minutes:.0f} minutos)", inline=True)
-        embed.set_thumbnail(url=bot.user.avatar.url if bot.user.avatar else None)
-        await channel.send(embed=embed)
-
-        # Actualizar mensaje en DM para remover el botón
-        try:
-            await interaction.message.edit(view=None)
-        except discord.HTTPException:
-            pass  # Ignorar si no se puede editar el mensaje
-
-        # Confirmación al usuario
-        await interaction.response.send_message(embed=create_embed(
-            title="✅ Servicio Terminado",
-            description=f"Has terminado tu servicio. Duración: **{hours:.2f} horas** ({minutes:.0f} minutos).",
-            color=Colors.SUCCESS
-        ), ephemeral=True)
 
 # Tarea semanal para el oficial más activo
 @tasks.loop(seconds=60)
@@ -237,33 +262,41 @@ async def weekly_leaderboard():
     local_tz = pytz.timezone('America/Mazatlan')
     now = datetime.now(local_tz)
     if now.weekday() == 0 and now.hour == 0 and now.minute == 0:  # Lunes a las 00:00 local
-        conn = sqlite3.connect('service_records.db')
-        c = conn.cursor()
-        c.execute('SELECT user_id, total_hours FROM user_hours ORDER BY total_hours DESC LIMIT 1')
-        result = c.fetchone()
-        
-        channel = bot.get_channel(Channels.SERVICIO)
-        if result and channel:
-            user_id, total_hours = result
-            user = await bot.fetch_user(user_id)
-            embed = create_embed(
-                title="🏆 Oficial Más Activo de la Semana",
-                description=f"¡Felicidades a **{user.display_name}** por ser el oficial más activo con **{total_hours:.2f} horas** de servicio esta semana! 🎉",
-                color=Colors.SUCCESS
+        try:
+            conn = mysql.connector.connect(
+                host=MYSQL_HOST,
+                user=MYSQL_USER,
+                password=MYSQL_PASSWORD,
+                database=MYSQL_DATABASE
             )
-            embed.set_thumbnail(url=user.avatar.url if user.avatar else None)
-            embed.set_author(name=user.display_name, icon_url=user.avatar.url if user.avatar else None)
-            await channel.send(embed=embed)
+            c = conn.cursor()
+            c.execute('SELECT user_id, total_hours FROM user_hours ORDER BY total_hours DESC LIMIT 1')
+            result = c.fetchone()
+            
+            channel = bot.get_channel(Channels.SERVICIO)
+            if result and channel:
+                user_id, total_hours = result
+                user = await bot.fetch_user(user_id)
+                embed = create_embed(
+                    title="🏆 Oficial Más Activo de la Semana",
+                    description=f"¡Felicidades a **{user.display_name}** por ser el oficial más activo con **{total_hours:.2f} horas** de servicio esta semana! 🎉",
+                    color=Colors.SUCCESS
+                )
+                embed.set_thumbnail(url=user.avatar.url if user.avatar else None)
+                embed.set_author(name=user.display_name, icon_url=user.avatar.url if user.avatar else None)
+                await channel.send(embed=embed)
 
-        # Reiniciar horas
-        c.execute('UPDATE user_hours SET total_hours = 0')
-        conn.commit()
-        conn.close()
+            # Reiniciar horas
+            c.execute('UPDATE user_hours SET total_hours = 0')
+            conn.commit()
+            conn.close()
+        except mysql.connector.Error as err:
+            print(f"Error en weekly_leaderboard: {err}")
 
 # Verificación de canal para iniciar-servicio
 def is_servicio_channel():
     async def predicate(interaction: discord.Interaction) -> bool:
-        if interaction.channel_id != Channels.SUGERIR_INPUT:  # Cambiado de SERVICIO a SUGERIR_INPUT (1345894050770845825)
+        if interaction.channel_id != Channels.SUGERIR_INPUT:
             await interaction.response.send_message(embed=create_embed(
                 title="❌ Canal Incorrecto",
                 description=f"Este comando solo puede usarse en <#{Channels.SUGERIR_INPUT}>.",
@@ -277,55 +310,65 @@ def is_servicio_channel():
 @bot.tree.command(name="iniciar-servicio", description="Inicia un período de servicio y registra la hora de entrada")
 @is_servicio_channel()
 async def iniciar_servicio(interaction: discord.Interaction):
-    # Verificar si el usuario ya tiene un servicio activo
-    conn = sqlite3.connect('service_records.db')
-    c = conn.cursor()
-    c.execute('SELECT id FROM service_records WHERE user_id = ? AND end_time IS NULL', (interaction.user.id,))
-    if c.fetchone():
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
+        )
+        c = conn.cursor()
+        c.execute('SELECT id FROM service_records WHERE user_id = %s AND end_time IS NULL', (interaction.user.id,))
+        if c.fetchone():
+            await interaction.response.send_message(embed=create_embed(
+                title="❌ Servicio Activo",
+                description="Ya tienes un servicio activo. Termínalo en tus DMs antes de iniciar uno nuevo.",
+                color=Colors.DANGER
+            ), ephemeral=True)
+            conn.close()
+            return
+
+        local_tz = pytz.timezone('America/Mazatlan')
+        start_time = datetime.now(local_tz)
+        c.execute('INSERT INTO service_records (user_id, start_time) VALUES (%s, %s)',
+                  (interaction.user.id, start_time.isoformat()))
+        conn.commit()
+        conn.close()
+
+        # Enviar DM al usuario
+        embed = create_embed(
+            title="🚨 Inicio de Servicio | Santiago RP",
+            description=(
+                f"Has iniciado tu servicio el **{start_time.strftime('%Y-%m-%d %H:%M:%S')}**.\n\n"
+                "**Advertencias**:\n"
+                "- Si no estás roleando durante este período, serás acreedor a una **sanción**.\n"
+                "- Si no estás en el canal de radio (<https://discord.com/channels/1339386615147266108/1353854926220034099>), serás acreedor a una **sanción**.\n\n"
+                "Usa el botón abajo para terminar tu servicio."
+            ),
+            color=Colors.PRIMARY
+        )
+        view = ServiceButtons(interaction.user.id)
+        try:
+            await interaction.user.send(embed=embed, view=view)
+        except discord.Forbidden:
+            await interaction.response.send_message(embed=create_embed(
+                title="⚠️ No se pudo enviar DM",
+                description="No puedo enviarte un mensaje directo. Habilita los DMs del servidor para recibir detalles de tu servicio.",
+                color=Colors.WARNING
+            ), ephemeral=True)
+            return
+
         await interaction.response.send_message(embed=create_embed(
-            title="❌ Servicio Activo",
-            description="Ya tienes un servicio activo. Termínalo en tus DMs antes de iniciar uno nuevo.",
+            title="✅ Servicio Iniciado",
+            description="Tu servicio ha comenzado. Revisa tus DMs para terminar el servicio.",
+            color=Colors.SUCCESS
+        ), ephemeral=True)
+    except mysql.connector.Error as err:
+        await interaction.response.send_message(embed=create_embed(
+            title="❌ Error",
+            description=f"No se pudo registrar el servicio debido a un error en la base de datos: {err}",
             color=Colors.DANGER
         ), ephemeral=True)
-        conn.close()
-        return
-
-    local_tz = pytz.timezone('America/Mazatlan')
-    start_time = datetime.now(local_tz)
-    c.execute('INSERT INTO service_records (user_id, start_time) VALUES (?, ?)',
-              (interaction.user.id, start_time.isoformat()))
-    conn.commit()
-    conn.close()
-
-    # Enviar DM al usuario
-    embed = create_embed(
-        title="🚨 Inicio de Servicio | Santiago RP",
-        description=(
-            f"Has iniciado tu servicio el **{start_time.strftime('%Y-%m-%d %H:%M:%S')}**.\n\n"
-            "**Advertencias**:\n"
-            "- Si no estás roleando durante este período, serás acreedor a una **sanción**.\n"
-            "- Si no estás en el canal de radio (<https://discord.com/channels/1339386615147266108/1353854926220034099>), serás acreedor a una **sanción**.\n\n"
-            "Usa el botón abajo para terminar tu servicio."
-        ),
-        color=Colors.PRIMARY
-    )
-    view = ServiceButtons(interaction.user.id)
-    try:
-        await interaction.user.send(embed=embed, view=view)
-    except discord.Forbidden:
-        await interaction.response.send_message(embed=create_embed(
-            title="⚠️ No se pudo enviar DM",
-            description="No puedo enviarte un mensaje directo. Habilita los DMs del servidor para recibir detalles de tu servicio.",
-            color=Colors.WARNING
-        ), ephemeral=True)
-        return
-
-    # Confirmación al usuario
-    await interaction.response.send_message(embed=create_embed(
-        title="✅ Servicio Iniciado",
-        description="Tu servicio ha comenzado. Revisa tus DMs para terminar el servicio.",
-        color=Colors.SUCCESS
-    ), ephemeral=True)
 
 # Modals para tickets
 class PostularPDIModal(ui.Modal, title="Postular a la PDI"):
@@ -368,7 +411,6 @@ class PostularPDIModal(ui.Modal, title="Postular a la PDI"):
             )
             return
 
-        # Crear canal con permisos
         channel_name = f"postular-pdi-{ticket_counter:03d}"
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -382,7 +424,6 @@ class PostularPDIModal(ui.Modal, title="Postular a la PDI"):
             overwrites=overwrites
         )
 
-        # Enviar embed al canal de tickets
         embed = create_embed(
             title="🎫 Ticket Abierto | Postular a la PDI",
             description=f"**Abierto por**: {interaction.user.mention}\n\n**Detalles de la postulación:**",
@@ -394,7 +435,6 @@ class PostularPDIModal(ui.Modal, title="Postular a la PDI"):
         view = TicketButtons()
         await ticket_channel.send(embed=embed, view=view)
 
-        # Confirmación al usuario
         await interaction.response.send_message(
             embed=create_embed(
                 title="✅ Ticket Abierto",
@@ -404,7 +444,6 @@ class PostularPDIModal(ui.Modal, title="Postular a la PDI"):
             ephemeral=True
         )
 
-        # Log
         log_channel = bot.get_channel(Channels.TICKET_LOG)
         if log_channel:
             await log_channel.send(embed=create_embed(
@@ -452,7 +491,6 @@ class ReportarOficialModal(ui.Modal, title="Reportar Oficial"):
             )
             return
 
-        # Crear canal con permisos
         channel_name = f"reportar-oficial-{ticket_counter:03d}"
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -466,7 +504,6 @@ class ReportarOficialModal(ui.Modal, title="Reportar Oficial"):
             overwrites=overwrites
         )
 
-        # Enviar embed al canal de tickets
         embed = create_embed(
             title="🎫 Ticket Abierto | Reportar Oficial",
             description=f"**Abierto por**: {interaction.user.mention}\n\n**Detalles del reporte:**",
@@ -478,7 +515,6 @@ class ReportarOficialModal(ui.Modal, title="Reportar Oficial"):
         view = TicketButtons()
         await ticket_channel.send(embed=embed, view=view)
 
-        # Confirmación al usuario
         await interaction.response.send_message(
             embed=create_embed(
                 title="✅ Ticket Abierto",
@@ -488,7 +524,6 @@ class ReportarOficialModal(ui.Modal, title="Reportar Oficial"):
             ephemeral=True
         )
 
-        # Log
         log_channel = bot.get_channel(Channels.TICKET_LOG)
         if log_channel:
             await log_channel.send(embed=create_embed(
@@ -536,7 +571,6 @@ class DenunciaModal(ui.Modal, title="Denuncia"):
             )
             return
 
-        # Crear canal con permisos
         channel_name = f"denuncia-{ticket_counter:03d}"
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -551,7 +585,6 @@ class DenunciaModal(ui.Modal, title="Denuncia"):
             overwrites=overwrites
         )
 
-        # Enviar embed al canal de tickets
         embed = create_embed(
             title="🎫 Ticket Abierto | Denuncia",
             description=f"**Abierto por**: {interaction.user.mention}\n\n**Detalles de la denuncia:**",
@@ -563,7 +596,6 @@ class DenunciaModal(ui.Modal, title="Denuncia"):
         view = TicketButtons()
         await ticket_channel.send(embed=embed, view=view)
 
-        # Confirmación al usuario
         await interaction.response.send_message(
             embed=create_embed(
                 title="✅ Ticket Abierto",
@@ -573,7 +605,6 @@ class DenunciaModal(ui.Modal, title="Denuncia"):
             ephemeral=True
         )
 
-        # Log
         log_channel = bot.get_channel(Channels.TICKET_LOG)
         if log_channel:
             await log_channel.send(embed=create_embed(
@@ -621,7 +652,6 @@ class ApelarSancionModal(ui.Modal, title="Apelar Sanción"):
             )
             return
 
-        # Crear canal con permisos
         channel_name = f"apelar-sancion-{ticket_counter:03d}"
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -636,7 +666,6 @@ class ApelarSancionModal(ui.Modal, title="Apelar Sanción"):
             overwrites=overwrites
         )
 
-        # Enviar embed al canal de tickets
         embed = create_embed(
             title="🎫 Ticket Abierto | Apelar Sanción",
             description=f"**Abierto por**: {interaction.user.mention}\n\n**Detalles de la apelación:**",
@@ -648,7 +677,6 @@ class ApelarSancionModal(ui.Modal, title="Apelar Sanción"):
         view = TicketButtons()
         await ticket_channel.send(embed=embed, view=view)
 
-        # Confirmación al usuario
         await interaction.response.send_message(
             embed=create_embed(
                 title="✅ Ticket Abierto",
@@ -658,7 +686,6 @@ class ApelarSancionModal(ui.Modal, title="Apelar Sanción"):
             ephemeral=True
         )
 
-        # Log
         log_channel = bot.get_channel(Channels.TICKET_LOG)
         if log_channel:
             await log_channel.send(embed=create_embed(
@@ -677,7 +704,6 @@ class CerrarCasoModal(ui.Modal, title="Cerrar Caso"):
     )
 
     async def on_submit(self, interaction: discord.Interaction):
-        # Enviar mensaje de cierre
         embed = create_embed(
             title="🔒 Ticket Cerrado",
             description=f"**Cerrado por**: {interaction.user.mention}\n**Razón**: {self.reason.value}",
@@ -685,7 +711,6 @@ class CerrarCasoModal(ui.Modal, title="Cerrar Caso"):
         )
         await interaction.response.send_message(embed=embed)
 
-        # Log
         log_channel = bot.get_channel(Channels.TICKET_LOG)
         if log_channel:
             await log_channel.send(embed=create_embed(
@@ -694,7 +719,6 @@ class CerrarCasoModal(ui.Modal, title="Cerrar Caso"):
                 color=Colors.WARNING
             ))
 
-        # Bloquear el canal
         await interaction.channel.edit(overwrites={
             interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
             interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=False),
@@ -703,7 +727,6 @@ class CerrarCasoModal(ui.Modal, title="Cerrar Caso"):
             interaction.guild.get_role(Roles.TICKET_VIEW_2): discord.PermissionOverwrite(read_messages=True, send_messages=False)
         })
 
-        # Eliminar canal después de 5 segundos
         await asyncio.sleep(5)
         await interaction.channel.delete()
 
@@ -1008,7 +1031,6 @@ class TicketView(ui.View):
                 )
                 return
 
-            # Crear canal con permisos
             channel_name = f"ayuda-general-{ticket_counter:03d}"
             overwrites = {
                 interaction.guild.default_role: discord.PermissionOverwrite(read_messages=False),
@@ -1023,7 +1045,6 @@ class TicketView(ui.View):
                 overwrites=overwrites
             )
 
-            # Enviar embed al canal de tickets
             embed = create_embed(
                 title="🎫 Ticket Abierto | Ayuda General",
                 description=f"**Abierto por**: {interaction.user.mention}\n\nPor favor, describe tu consulta o problema.",
@@ -1032,7 +1053,6 @@ class TicketView(ui.View):
             view = TicketButtons()
             await ticket_channel.send(embed=embed, view=view)
 
-            # Confirmación al usuario
             await interaction.response.send_message(
                 embed=create_embed(
                     title="✅ Ticket Abierto",
@@ -1042,7 +1062,6 @@ class TicketView(ui.View):
                 ephemeral=True
             )
 
-            # Log
             log_channel = bot.get_channel(Channels.TICKET_LOG)
             if log_channel:
                 await log_channel.send(embed=create_embed(
@@ -1065,7 +1084,6 @@ class TicketButtons(ui.View):
         )
         await interaction.response.send_message(embed=embed)
 
-        # Log
         log_channel = bot.get_channel(Channels.TICKET_LOG)
         if log_channel:
             await log_channel.send(embed=create_embed(
@@ -1217,7 +1235,6 @@ async def pdi_panel(interaction: discord.Interaction):
 @is_sugerir_channel()
 @is_allowed_user()
 async def sugerir(interaction: discord.Interaction, sugerencia: str, utilidad: str):
-    # Validar longitud de palabras
     sugerencia_words = sugerencia.split()
     utilidad_words = utilidad.split()
     
@@ -1237,14 +1254,12 @@ async def sugerir(interaction: discord.Interaction, sugerencia: str, utilidad: s
         ), ephemeral=True)
         return
 
-    # Enviar mensaje de éxito (efímero)
     await interaction.response.send_message(embed=create_embed(
         title="✅ Sugerencia Enviada",
         description="Tu sugerencia ha sido enviada con éxito.",
         color=Colors.SUCCESS
     ), ephemeral=True)
 
-    # Crear embed para el canal de sugerencias
     suggestion_embed = create_embed(
         title="💡 Nueva Sugerencia | Santiago RP",
         description=f"Sugerencia propuesta por **{interaction.user.display_name}**.",
@@ -1267,7 +1282,6 @@ async def sugerir(interaction: discord.Interaction, sugerencia: str, utilidad: s
     )
     suggestion_embed.set_thumbnail(url=interaction.user.avatar.url if interaction.user.avatar else "")
 
-    # Enviar embed al canal de sugerencias y añadir reacción
     suggestion_channel = bot.get_channel(Channels.SUGERIR_OUTPUT)
     if suggestion_channel:
         message = await suggestion_channel.send(embed=suggestion_embed)
@@ -1328,7 +1342,6 @@ async def buscar_a(
     grado_busqueda: str,
     foto: discord.Attachment
 ):
-    # Validar que el archivo es una imagen
     valid_extensions = ['.png', '.jpg', '.jpeg', '.gif']
     if not any(foto.filename.lower().endswith(ext) for ext in valid_extensions):
         await interaction.response.send_message(embed=create_embed(
@@ -1338,7 +1351,6 @@ async def buscar_a(
         ), ephemeral=True)
         return
 
-    # Crear embed de búsqueda
     embed = discord.Embed(
         title="🚨 FICHA DE BÚSQUEDA | PDI Santiago RP",
         description=f"**¡SE BUSCA!** {nombre.upper()}",
@@ -1353,7 +1365,6 @@ async def buscar_a(
     embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
     embed.set_footer(text="Santiago RP | Contacte a PDI con cualquier información")
 
-    # Enviar embed con ping al rol
     role = interaction.guild.get_role(Roles.BUSCA_PING)
     await interaction.response.send_message(
         content=f"<@&{Roles.BUSCA_PING}>",
@@ -1364,40 +1375,50 @@ async def buscar_a(
 @is_horas_semanales_channel()
 @is_allowed_horas_semanales()
 async def horas_semanales(interaction: discord.Interaction):
-    conn = sqlite3.connect('service_records.db')
-    c = conn.cursor()
-    c.execute('SELECT user_id, total_hours FROM user_hours')
-    users = c.fetchall()
-    conn.close()
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
+        )
+        c = conn.cursor()
+        c.execute('SELECT user_id, total_hours FROM user_hours')
+        users = c.fetchall()
+        conn.close()
 
-    if not users:
-        await interaction.response.send_message(embed=create_embed(
+        if not users:
+            await interaction.response.send_message(embed=create_embed(
+                title="📊 Horas Semanales | Santiago RP",
+                description="No hay usuarios registrados con horas en la base de datos.",
+                color=Colors.PRIMARY
+            ), ephemeral=True)
+            return
+
+        description_lines = []
+        for user_id, total_hours in users:
+            try:
+                user = await bot.fetch_user(user_id)
+                status = "✅" if total_hours >= 5 else "❌"
+                description_lines.append(f"{user.mention}: **{total_hours:.2f} horas** {status}")
+            except discord.NotFound:
+                status = "✅" if total_hours >= 5 else "❌"
+                description_lines.append(f"Usuario ID {user_id}: **{total_hours:.2f} horas** {status}")
+
+        embed = create_embed(
             title="📊 Horas Semanales | Santiago RP",
-            description="No hay usuarios registrados con horas en la base de datos.",
+            description="\n".join(description_lines),
             color=Colors.PRIMARY
+        )
+        embed.set_footer(text="✅ = 5+ horas | ❌ = Menos de 5 horas")
+
+        await interaction.response.send_message(embed=embed, ephemeral=False)
+    except mysql.connector.Error as err:
+        await interaction.response.send_message(embed=create_embed(
+            title="❌ Error",
+            description=f"No se pudieron obtener las horas debido a un error en la base de datos: {err}",
+            color=Colors.DANGER
         ), ephemeral=True)
-        return
-
-    # Construir el campo de descripción con todos los usuarios
-    description_lines = []
-    for user_id, total_hours in users:
-        try:
-            user = await bot.fetch_user(user_id)
-            status = "✅" if total_hours >= 5 else "❌"
-            description_lines.append(f"{user.mention}: **{total_hours:.2f} horas** {status}")
-        except discord.NotFound:
-            # Si el usuario no se encuentra (dejó el servidor), mostrar solo el ID
-            status = "✅" if total_hours >= 5 else "❌"
-            description_lines.append(f"Usuario ID {user_id}: **{total_hours:.2f} horas** {status}")
-
-    embed = create_embed(
-        title="📊 Horas Semanales | Santiago RP",
-        description="\n".join(description_lines),
-        color=Colors.PRIMARY
-    )
-    embed.set_footer(text="✅ = 5+ horas | ❌ = Menos de 5 horas")
-
-    await interaction.response.send_message(embed=embed, ephemeral=False)
 
 @bot.tree.command(name="sancionar-a", description="Registra una sanción para un usuario")
 @is_sancionar_channel()
@@ -1410,7 +1431,6 @@ async def horas_semanales(interaction: discord.Interaction):
 )
 @app_commands.autocomplete(tipo_sancion=tipo_sancion_autocomplete)
 async def sancionar_a(interaction: discord.Interaction, usuario: discord.Member, razon: str, tipo_sancion: str, archivo_prueba: discord.Attachment = None):
-    # Validar tipo_sancion
     valid_sanciones = ["1345894049818611868", "1345894049818611867", "1345894049818611866", "1345894049818611865"]
     if tipo_sancion not in valid_sanciones:
         await interaction.response.send_message(embed=create_embed(
@@ -1420,7 +1440,6 @@ async def sancionar_a(interaction: discord.Interaction, usuario: discord.Member,
         ), ephemeral=True)
         return
 
-    # Validar que archivo_prueba sea una imagen (si se proporcionó)
     foto_prueba_url = None
     if archivo_prueba:
         valid_extensions = ['.png', '.jpg', '.jpeg', '.gif']
@@ -1433,77 +1452,83 @@ async def sancionar_a(interaction: discord.Interaction, usuario: discord.Member,
             return
         foto_prueba_url = archivo_prueba.url
 
-    # Registrar sanción en la base de datos
-    conn = sqlite3.connect('service_records.db')
-    c = conn.cursor()
-    timestamp = datetime.now(dt.UTC).isoformat()
-    c.execute('''
-        INSERT INTO sanciones (user_id, oficial_id, razon, tipo_sancion, foto_prueba, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (usuario.id, interaction.user.id, razon, tipo_sancion, foto_prueba_url, timestamp))
-    conn.commit()
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
+        )
+        c = conn.cursor()
+        timestamp = datetime.now(dt.UTC).isoformat()
+        c.execute('''
+            INSERT INTO sanciones (user_id, oficial_id, razon, tipo_sancion, foto_prueba, timestamp)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        ''', (usuario.id, interaction.user.id, razon, tipo_sancion, foto_prueba_url, timestamp))
+        conn.commit()
 
-    # Contar sanciones del usuario
-    c.execute('SELECT COUNT(*) FROM sanciones WHERE user_id = ?', (usuario.id,))
-    sanciones_count = c.fetchone()[0]
-    conn.close()
+        c.execute('SELECT COUNT(*) FROM sanciones WHERE user_id = %s', (usuario.id,))
+        sanciones_count = c.fetchone()[0]
+        conn.close()
 
-    # Enviar DM si tiene 4 sanciones
-    if sanciones_count >= 4:
-        try:
-            await usuario.send(embed=create_embed(
-                title="⚠️ Advertencia de Sanciones",
-                description=(
-                    "Has acumulado **4 o más sanciones**. Estás en peligro de ser **revocado de servicio** o **baneado del servidor**.\n"
-                    "Por favor, revisa tu comportamiento y contacta a un administrador si tienes dudas."
-                ),
-                color=Colors.WARNING
-            ))
-        except discord.Forbidden:
-            pass  # Ignorar si los DMs están bloqueados
+        if sanciones_count >= 4:
+            try:
+                await usuario.send(embed=create_embed(
+                    title="⚠️ Advertencia de Sanciones",
+                    description=(
+                        "Has acumulado **4 o más sanciones**. Estás en peligro de ser **revocado de servicio** o **baneado del servidor**.\n"
+                        "Por favor, revisa tu comportamiento y contacta a un administrador si tienes dudas."
+                    ),
+                    color=Colors.WARNING
+                ))
+            except discord.Forbidden:
+                pass
 
-    # Crear embed para el canal de sanciones
-    sancion_name = {
-        "1345894049818611868": "Sanción 1",
-        "1345894049818611867": "Sanción 2",
-        "1345894049818611866": "Sanción 3",
-        "1345894049818611865": "Sanción 4"
-    }[tipo_sancion]
-    
-    embed = create_embed(
-        title="🚨 Ficha de Sanción | Santiago RP",
-        description=f"Se ha registrado una sanción para {usuario.mention}.",
-        color=Colors.DANGER
-    )
-    embed.add_field(name="Usuario Sancionado", value=usuario.mention, inline=True)
-    embed.add_field(name="Oficial", value=interaction.user.mention, inline=True)
-    embed.add_field(name="Razón", value=razon, inline=False)
-    embed.add_field(name="Tipo de Sanción", value=sancion_name, inline=True)
-    embed.add_field(name="Total de Sanciones", value=str(sanciones_count), inline=True)
-    if foto_prueba_url:
-        embed.add_field(name="Prueba", value=f"[Ver Prueba]({foto_prueba_url})", inline=False)
-        embed.set_image(url=foto_prueba_url)
-    embed.set_thumbnail(url=usuario.avatar.url if usuario.avatar else None)
-    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
+        sancion_name = {
+            "1345894049818611868": "Sanción 1",
+            "1345894049818611867": "Sanción 2",
+            "1345894049818611866": "Sanción 3",
+            "1345894049818611865": "Sanción 4"
+        }[tipo_sancion]
+        
+        embed = create_embed(
+            title="🚨 Ficha de Sanción | Santiago RP",
+            description=f"Se ha registrado una sanción para {usuario.mention}.",
+            color=Colors.DANGER
+        )
+        embed.add_field(name="Usuario Sancionado", value=usuario.mention, inline=True)
+        embed.add_field(name="Oficial", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Razón", value=razon, inline=False)
+        embed.add_field(name="Tipo de Sanción", value=sancion_name, inline=True)
+        embed.add_field(name="Total de Sanciones", value=str(sanciones_count), inline=True)
+        if foto_prueba_url:
+            embed.add_field(name="Prueba", value=f"[Ver Prueba]({foto_prueba_url})", inline=False)
+            embed.set_image(url=foto_prueba_url)
+        embed.set_thumbnail(url=usuario.avatar.url if usuario.avatar else None)
+        embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar.url if interaction.user.avatar else None)
 
-    # Enviar embed al canal de sanciones
-    sanciones_channel = bot.get_channel(1365195938674511913)
-    if sanciones_channel:
-        await sanciones_channel.send(embed=embed)
-    else:
+        sanciones_channel = bot.get_channel(1365195938674511913)
+        if sanciones_channel:
+            await sanciones_channel.send(embed=embed)
+        else:
+            await interaction.response.send_message(embed=create_embed(
+                title="❌ Error",
+                description="No se pudo enviar la sanción al canal de sanciones. Contacta a un administrador.",
+                color=Colors.DANGER
+            ), ephemeral=True)
+            return
+
+        await interaction.response.send_message(embed=create_embed(
+            title="✅ Sanción Registrada",
+            description=f"La sanción para {usuario.mention} ha sido enviada al canal <#{1365195938674511913}>.",
+            color=Colors.SUCCESS
+        ), ephemeral=True)
+    except mysql.connector.Error as err:
         await interaction.response.send_message(embed=create_embed(
             title="❌ Error",
-            description="No se pudo enviar la sanción al canal de sanciones. Contacta a un administrador.",
+            description=f"No se pudo registrar la sanción debido a un error en la base de datos: {err}",
             color=Colors.DANGER
         ), ephemeral=True)
-        return
-
-    # Confirmación efímera al oficial
-    await interaction.response.send_message(embed=create_embed(
-        title="✅ Sanción Registrada",
-        description=f"La sanción para {usuario.mention} ha sido enviada al canal <#{1365195938674511913}>.",
-        color=Colors.SUCCESS
-    ), ephemeral=True)
 
 # Iniciar el bot
 if __name__ == "__main__":
